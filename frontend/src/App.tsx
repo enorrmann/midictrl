@@ -133,7 +133,12 @@ function App() {
 
   const handleMoveNode = useCallback((id: string, newPos: { x: number; y: number }) => {
     setPositions((prev) => {
-      const next = { ...prev, [id]: newPos };
+      const maxX = typeof window !== 'undefined' ? window.innerWidth - 100 : 2000;
+      const maxY = typeof window !== 'undefined' ? window.innerHeight - 50 : 2000;
+      const clampedX = Math.max(0, Math.min(newPos.x, maxX));
+      const clampedY = Math.max(0, Math.min(newPos.y, maxY));
+      
+      const next = { ...prev, [id]: { x: clampedX, y: clampedY } };
       localStorage.setItem('nodePositions', JSON.stringify(next));
       return next;
     });
@@ -286,6 +291,25 @@ function App() {
     }
   };
 
+  const handleRearrange = () => {
+    setPositions(() => {
+      const next: Record<string, { x: number; y: number }> = {};
+      let index = 0;
+      clients.forEach((c) => {
+        if (c.inputs.length > 0) {
+          next[`${c.id}-src`] = { x: 50 + (index % 3) * 300, y: 150 + Math.floor(index / 3) * 200 };
+          index++;
+        }
+        if (c.outputs.length > 0) {
+          next[`${c.id}-dest`] = { x: 50 + (index % 3) * 300, y: 150 + Math.floor(index / 3) * 200 };
+          index++;
+        }
+      });
+      localStorage.setItem('nodePositions', JSON.stringify(next));
+      return next;
+    });
+  };
+
   const toggleSource = (id: string) => setSelectedSources(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   const toggleDest = (id: string) => setSelectedDests(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
 
@@ -296,6 +320,7 @@ function App() {
       <div className="canvas-toolbar">
         <h1 className="title">ALSA Graph</h1>
         <div className="canvas-controls">
+          <button className="btn" onClick={handleRearrange}>Rearrange</button>
           <button className="btn" onClick={() => handleAction('connect')}>Connect</button>
           <button className="btn" onClick={() => handleAction('disconnect')}>Disconnect</button>
           <button className="btn btn-danger" onClick={handleDisconnectAll}>Disconnect All</button>
