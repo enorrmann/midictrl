@@ -90,7 +90,7 @@ function App() {
   const srcRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const destRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
-  const API_BASE = `http://${window.location.hostname}:3001/api`;
+  const API_BASE = '/api';
 
   const fetchState = async () => {
     try {
