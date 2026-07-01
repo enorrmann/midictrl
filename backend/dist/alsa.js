@@ -83,6 +83,7 @@ async function scanRawMidi() {
         // ignore missing card names
     }
     const byCard = new Map();
+    const allCards = new Set();
     // First, collect all existing device files
     let devs = [];
     try {
@@ -95,12 +96,17 @@ async function scanRawMidi() {
         const m = f.match(/^midiC(\d+)D(\d+)$/);
         if (!m)
             continue;
+        allCards.add(m[1]);
         if (!byCard.has(m[1]))
             byCard.set(m[1], []);
         byCard.get(m[1]).push(f);
     }
-    // For each known card, proactively probe for ports up to D7
+    // Also track cards from /proc/asound/cards
     for (const card of cardNames.keys()) {
+        allCards.add(card);
+    }
+    // For each discovered card, proactively probe for ports up to D7
+    for (const card of allCards) {
         if (!byCard.has(card))
             byCard.set(card, []);
         const cardDevs = byCard.get(card);
