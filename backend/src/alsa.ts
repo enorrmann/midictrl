@@ -1,15 +1,12 @@
 /**
  * alsa.ts – RawMIDI bridge backend.
  *
- * Enumeration prefers ALSA client/port information from aconnect when available,
- * then falls back to direct /dev/snd/midiC<N>D<M> discovery for raw routing.
+ * Enumeration: scan /dev/snd/midiC<N>D<M> directly and proactively probe
+ * for additional ports per card.
+ * Routing: stream bytes from one raw MIDI device to another.
  */
 
 import * as fs from 'fs';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-
-const execFileAsync = promisify(execFile);
 
 export interface Port {
     id: string;
@@ -27,145 +24,8 @@ export interface UnifiedClient {
     outputs: Port[];
 }
 
-interface ParsedAconnectPort {
-    portNum: string;
-    name: string;
-    connectingTo: string[];
-    connectedFrom: string[];
-}
-
-interface ParsedAconnectClient {
-    id: string;
-    name: string;
-    type: string;
-    ports: ParsedAconnectPort[];
-}
-
 interface Route { reader: fs.ReadStream; writer: fs.WriteStream; }
 const routes = new Map<string, Route>();
-const clientCard = new Map<string, string>();
-const SKIP = new Set(['0', '14']);
-
-export function parseAconnectList(output: string): ParsedAconnectClient[] {
-    const clients: ParsedAconnectClient[] = [];
-    let currentClient: ParsedAconnectClient | null = null;
-    let currentPort: ParsedAconnectPort | null = null;
-
-    for (const rawLine of output.split('\n')) {
-        const line = rawLine.trimEnd();
-        const clientMatch = line.match(/^client\s+(\d+):\s+'([^']+)'\s+\[([^\]]*)\]/);
-        if (clientMatch) {
-            currentPort = null;
-            currentClient = {
-                id: clientMatch[1],
-                name: clientMatch[2],
-                type: clientMatch[3],
-                ports: []
-            };
-            clients.push(currentClient);
-            continue;
-        }
-
-        if (!currentClient) continue;
-
-        const portMatch = line.match(/^\s+(\d+)\s+'([^']+)'/);
-        if (portMatch) {
-            currentPort = {
-                portNum: portMatch[1],
-                name: portMatch[2].trim(),
-                connectingTo: [],
-                connectedFrom: []
-            };
-            currentClient.ports.push(currentPort);
-            continue;
-        }
-
-        if (!currentPort) continue;
-
-        const connectingTo = line.match(/^\s+Connecting To:\s+(.+)$/);
-        if (connectingTo) {
-            currentPort.connectingTo = connectingTo[1]
-                .split(',')
-                .map(item => item.trim())
-                .filter(Boolean);
-            continue;
-        }
-
-        const connectedFrom = line.match(/^\s+Connected From:\s+(.+)$/);
-        if (connectedFrom) {
-            currentPort.connectedFrom = connectedFrom[1]
-                .split(',')
-                .map(item => item.trim())
-                .filter(Boolean);
-        }
-    }
-
-    return clients;
-}
-
-async function resolveDevPath(portId: string): Promise<string | null> {
-    const rawM = portId.match(/^C(\d+)D(\d+)$/);
-    if (rawM) {
-        return `/dev/snd/midiC${rawM[1]}D${rawM[2]}`;
-    }
-
-    const seqM = portId.match(/^(\d+):(\d+)$/);
-    if (seqM) {
-        const card = clientCard.get(seqM[1]);
-        if (card !== undefined) {
-            const candidates = [
-                `/dev/snd/midiC${card}D${seqM[2]}`,
-                `/dev/snd/midiC${card}D0`,
-                `/dev/snd/midiC${card}D1`
-            ];
-
-            for (const candidate of candidates) {
-                try {
-                    await fs.promises.access(candidate, fs.constants.R_OK | fs.constants.W_OK);
-                    return candidate;
-                } catch {
-                    // try the next candidate
-                }
-            }
-        }
-    }
-
-    return null;
-}
-
-function toUnifiedClients(rawClients: ParsedAconnectClient[]): UnifiedClient[] {
-    clientCard.clear();
-    const unified: UnifiedClient[] = [];
-
-    for (const rc of rawClients) {
-        if (SKIP.has(rc.id)) continue;
-
-        const cardMatch = rc.type.match(/card=(\d+)/);
-        if (cardMatch) clientCard.set(rc.id, cardMatch[1]);
-
-        const inputs: Port[] = [];
-        const outputs: Port[] = [];
-
-        for (const rp of rc.ports) {
-            const pid = `${rc.id}:${rp.portNum}`;
-            const base = {
-                id: pid,
-                client: rc.id,
-                name: rp.name,
-                type: 'rawmidi'
-            };
-
-            inputs.push({ ...base, connections: rp.connectingTo });
-            outputs.push({ ...base, connections: rp.connectedFrom });
-        }
-
-        if (inputs.length || outputs.length) {
-            unified.push({ id: rc.id, name: rc.name, type: rc.type, inputs, outputs });
-        }
-    }
-
-    return unified;
-}
 
 export function attachRouteConnections(clients: UnifiedClient[], routeMap: Map<string, Route>): UnifiedClient[] {
     return clients.map(client => {
@@ -179,8 +39,8 @@ export function attachRouteConnections(clients: UnifiedClient[], routeMap: Map<s
 
         const destPorts = client.outputs.map(port => {
             const routeSources = [...routeMap.entries()]
-                .filter(([key]) => key.endsWith(`->${port.id}`))
-                .map(([key]) => key.split('->')[0]);
+                .filter(([routeKey]) => routeKey.endsWith(`->${port.id}`))
+                .map(([routeKey]) => routeKey.split('->')[0]);
             const uniqueConnections = Array.from(new Set([...port.connections, ...routeSources]));
             return { ...port, connections: uniqueConnections };
         });
@@ -189,39 +49,12 @@ export function attachRouteConnections(clients: UnifiedClient[], routeMap: Map<s
     });
 }
 
-async function listFromAconnect(): Promise<UnifiedClient[] | null> {
-    try {
-        const { stdout } = await execFileAsync('aconnect', ['-l'], { encoding: 'utf8' });
-        return toUnifiedClients(parseAconnectList(stdout));
-    } catch (error) {
-        if (error && typeof error === 'object' && 'stdout' in error) {
-            const stdout = String((error as { stdout?: string }).stdout ?? '');
-            if (stdout) {
-                return toUnifiedClients(parseAconnectList(stdout));
-            }
-        }
-        return null;
-    }
-}
-
 export async function getAlsaState(): Promise<UnifiedClient[]> {
-    const fromAconnect = await listFromAconnect();
-    if (fromAconnect && fromAconnect.length > 0) {
-        return attachRouteConnections(fromAconnect, routes);
-    }
-
     const rawMidi = await scanRawMidi();
     return attachRouteConnections(rawMidi, routes);
 }
 
 async function scanRawMidi(): Promise<UnifiedClient[]> {
-    let devs: string[] = [];
-    try {
-        devs = (await fs.promises.readdir('/dev/snd')).filter(f => /^midiC\d+D\d+$/.test(f));
-    } catch {
-        return [];
-    }
-
     const cardNames = new Map<string, string>();
     try {
         for (const line of (await fs.promises.readFile('/proc/asound/cards', 'utf8')).split('\n')) {
@@ -233,6 +66,15 @@ async function scanRawMidi(): Promise<UnifiedClient[]> {
     }
 
     const byCard = new Map<string, string[]>();
+
+    // First, collect all existing device files
+    let devs: string[] = [];
+    try {
+        devs = (await fs.promises.readdir('/dev/snd')).filter(f => /^midiC\d+D\d+$/.test(f));
+    } catch {
+        // no /dev/snd, proceed without it
+    }
+
     for (const f of devs) {
         const m = f.match(/^midiC(\d+)D(\d+)$/);
         if (!m) continue;
@@ -240,8 +82,32 @@ async function scanRawMidi(): Promise<UnifiedClient[]> {
         byCard.get(m[1])!.push(f);
     }
 
+    // For each known card, proactively probe for ports up to D7
+    for (const card of cardNames.keys()) {
+        if (!byCard.has(card)) byCard.set(card, []);
+        const cardDevs = byCard.get(card)!;
+
+        for (let portNum = 0; portNum <= 7; portNum++) {
+            const devPath = `/dev/snd/midiC${card}D${portNum}`;
+            const devName = `midiC${card}D${portNum}`;
+
+            // Skip if already found
+            if (cardDevs.some(f => f.includes(`D${portNum}`))) continue;
+
+            // Try to access the device
+            try {
+                await fs.promises.access(devPath, fs.constants.R_OK | fs.constants.W_OK);
+                cardDevs.push(devName);
+            } catch {
+                // Device does not exist or is not accessible
+            }
+        }
+    }
+
     const unified: UnifiedClient[] = [];
     for (const [card, files] of byCard) {
+        if (files.length === 0) continue;
+
         const name = cardNames.get(card) ?? `Card ${card}`;
         const inputs: Port[] = [];
         const outputs: Port[] = [];
@@ -260,6 +126,14 @@ async function scanRawMidi(): Promise<UnifiedClient[]> {
     }
 
     return unified;
+}
+
+async function resolveDevPath(portId: string): Promise<string | null> {
+    const rawM = portId.match(/^C(\d+)D(\d+)$/);
+    if (rawM) {
+        return `/dev/snd/midiC${rawM[1]}D${rawM[2]}`;
+    }
+    return null;
 }
 
 export async function connectPorts(src: string, dest: string): Promise<void> {
